@@ -1,0 +1,6 @@
+{
+  "name": "Biên mục Sách DDC và MARC 21",
+  "description": "Trang web nhập dữ liệu biên mục sách theo chuẩn DDC và MARC 21, hỗ trợ nhập thủ công, nhập từ MARC 21 thô, nhập/xuất Excel và lưu trữ vào Google Sheets.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
