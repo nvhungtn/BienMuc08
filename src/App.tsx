@@ -178,6 +178,15 @@ export default function App() {
   const [isbnSearchQuery, setIsbnSearchQuery] = useState("");
   const [isSearchingIsbn, setIsSearchingIsbn] = useState(false);
 
+  // Duplicate modal states
+  const [showDuplicateModal, setShowDuplicateModal] = useState(false);
+  const [pendingRecord, setPendingRecord] = useState<BookRecord | null>(null);
+  const [duplicateWarningInfo, setDuplicateWarningInfo] = useState<{ title: string; barcode: string; isbn: string; isEdit: boolean } | null>(null);
+
+  // Barcode scanner automatic search auto-trigger refs
+  const lastAutoSearched = useRef("");
+  const autoSearchTimeout = useRef<any>(null);
+
   // Dark Mode State
   const [darkMode, setDarkMode] = useState<boolean>(() => localStorage.getItem("theme") === "dark");
 
@@ -638,9 +647,12 @@ export default function App() {
   };
 
   // Search ISBN from the National Library / API proxy (using OPAC crawling and hybrid caching)
-  const handleIsbnSearch = async (e: FormEvent) => {
-    e.preventDefault();
-    if (!isbnSearchQuery.trim()) {
+  const handleIsbnSearch = async (e?: FormEvent | string) => {
+    if (e && typeof e !== "string") {
+      e.preventDefault();
+    }
+    const query = typeof e === "string" ? e : isbnSearchQuery;
+    if (!query.trim()) {
       triggerMessage("error", "Vui lòng nhập mã ISBN.");
       return;
     }
@@ -652,14 +664,14 @@ export default function App() {
       const res = await fetch(`${apiBaseUrl}/api/search`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ isbn: isbnSearchQuery.trim() })
+        body: JSON.stringify({ isbn: query.trim() })
       });
       
       const text = await res.text();
       let data: any = null;
       try {
         data = text ? JSON.parse(text) : {};
-      } catch (e) {
+      } catch (err) {
         const isHtml = text.toLowerCase().includes("<html") || text.toLowerCase().includes("<!doctype");
         if (isHtml) {
           throw new Error("Phản hồi từ máy chủ không hợp lệ (Trang HTML). Vui lòng kiểm tra lại trạng thái đăng nhập hoặc tải lại trang.");
@@ -695,6 +707,21 @@ export default function App() {
       triggerMessage("error", `Không tra cứu được thông tin: ${err?.message || "Lỗi kết nối máy chủ"}`);
     } finally {
       setIsSearchingIsbn(false);
+    }
+  };
+
+  // Auto-search and format when barcode scanner scans or user inputs a complete ISBN
+  const handleIsbnInputChange = (val: string) => {
+    setIsbnSearchQuery(val);
+    const digits = val.replace(/[^0-9Xx]/g, "");
+    if (digits.length === 10 || digits.length === 13) {
+      if (autoSearchTimeout.current) clearTimeout(autoSearchTimeout.current);
+      autoSearchTimeout.current = setTimeout(() => {
+        if (digits !== lastAutoSearched.current) {
+          lastAutoSearched.current = digits;
+          handleIsbnSearch(val);
+        }
+      }, 400); // 400ms debounce allows rapid typed scanner output to settle
     }
   };
 
@@ -799,20 +826,51 @@ export default function App() {
       newRecord.rawMarc = generateMarc21Text(newRecord);
     }
 
+    // Check for duplicate barcode or duplicate ISBN/Title
+    const cleanNewIsbn = newRecord.isbn?.replace(/[- ]/g, "") || "";
+    const duplicateBook = records.find(r => {
+      if (r.id === newRecord.id) return false;
+
+      // 1. Same barcode (most common identifier of duplicate copy)
+      const sameBarcode = r.barcode?.trim().toLowerCase() === newRecord.barcode?.trim().toLowerCase();
+
+      // 2. Same ISBN & Title (duplicate book title entry)
+      const cleanRecordIsbn = r.isbn?.replace(/[- ]/g, "") || "";
+      const sameIsbnAndTitle = cleanNewIsbn && cleanNewIsbn === cleanRecordIsbn && r.title?.trim().toLowerCase() === newRecord.title?.trim().toLowerCase();
+
+      return sameBarcode || sameIsbnAndTitle;
+    });
+
+    if (duplicateBook) {
+      setPendingRecord(newRecord);
+      setDuplicateWarningInfo({
+        title: duplicateBook.title,
+        barcode: duplicateBook.barcode || "",
+        isbn: duplicateBook.isbn || "",
+        isEdit
+      });
+      setShowDuplicateModal(true);
+      return;
+    }
+
+    await executeSaveRecord(newRecord, isEdit);
+  };
+
+  const executeSaveRecord = async (recordToSave: BookRecord, isEdit: boolean) => {
     setIsSaving(true);
     try {
       // Correctly update local records list depending on edit vs add
       let updatedRecords: BookRecord[];
       if (isEdit) {
-        updatedRecords = records.map(r => r.id === newRecord.id ? newRecord : r);
+        updatedRecords = records.map(r => r.id === recordToSave.id ? recordToSave : r);
       } else {
-        updatedRecords = [newRecord, ...records];
+        updatedRecords = [recordToSave, ...records];
       }
 
       // Sort records from newest to oldest
       updatedRecords = [...updatedRecords].sort((a, b) => parseDateGMT7(b.createdAt) - parseDateGMT7(a.createdAt));
 
-      // Reset form
+      // Reset form (this only happens on SUCCESSFUL save)
       setFormRecord({ ...emptyRecord });
       setRawMarcInput("");
 
@@ -833,13 +891,13 @@ export default function App() {
           triggerMessage("success", isEdit ? "Đã cập nhật bản ghi thành công và đồng bộ sang Google Sheets!" : "Đã biên mục bản ghi mới thành công và đồng bộ sang Google Sheets!");
         } catch (syncErr: any) {
           console.warn("Direct sync failed, saving locally as unsynced:", syncErr);
-          const unsyncedRecords = updatedRecords.map(r => r.id === newRecord.id ? { ...r, unsynced: true } : r);
+          const unsyncedRecords = updatedRecords.map(r => r.id === recordToSave.id ? { ...r, unsynced: true } : r);
           setRecords(unsyncedRecords);
           localStorage.setItem("cataloged_records", JSON.stringify(unsyncedRecords));
           triggerMessage("success", "Đã lưu tạm tại máy tính (Chờ đồng bộ) do mất kết nối Google Sheets.");
         }
       } else {
-        const unsyncedRecords = updatedRecords.map(r => r.id === newRecord.id ? { ...r, unsynced: true } : r);
+        const unsyncedRecords = updatedRecords.map(r => r.id === recordToSave.id ? { ...r, unsynced: true } : r);
         setRecords(unsyncedRecords);
         localStorage.setItem("cataloged_records", JSON.stringify(unsyncedRecords));
         triggerMessage("success", "Đang ngoại tuyến. Đã lưu tạm tại máy tính, hệ thống sẽ tự động đồng bộ khi có mạng.");
@@ -1129,8 +1187,14 @@ export default function App() {
                       <input
                         type="text"
                         value={isbnSearchQuery}
-                        onChange={(e) => setIsbnSearchQuery(e.target.value)}
-                        placeholder="Nhập mã ISBN (ví dụ: 9786043184815)"
+                        onChange={(e) => handleIsbnInputChange(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            e.preventDefault();
+                            handleIsbnSearch();
+                          }
+                        }}
+                        placeholder="Nhập mã ISBN hoặc quét bằng máy quét..."
                         className="flex-1 bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-emerald-500/30 focus:border-emerald-500"
                       />
                       <button
@@ -1147,8 +1211,9 @@ export default function App() {
                         Tìm
                       </button>
                     </div>
-                    <p className="text-[10px] text-slate-500 mt-2 leading-normal">
-                      Hệ thống sẽ tự động tra cứu trên CSDL Thư viện Quốc gia Việt Nam & các nhà sách để tự động điền đầy đủ 15 trường thông tin.
+                    <p className="text-[10px] text-slate-500 mt-2 leading-normal flex items-center gap-1">
+                      <span className="inline-block w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse"></span>
+                      <span>Hỗ trợ máy quét mã vạch. Tự động tra cứu khi điền đủ 10 hoặc 13 số ISBN trên CSDL Thư viện Quốc gia Việt Nam.</span>
                     </p>
                   </div>
 
@@ -2370,6 +2435,81 @@ export default function App() {
           </div>
         </div>
       </footer>
+
+      {/* Duplicate Warning Modal */}
+      {showDuplicateModal && duplicateWarningInfo && (
+        <div className="fixed inset-0 bg-slate-950/40 backdrop-blur-xs flex items-center justify-center p-4 z-[9999] animate-fade-in" id="duplicate-warning-modal">
+          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-100 transform scale-100 transition-all duration-300">
+            <div className="flex items-center gap-3 text-amber-600 mb-4">
+              <div className="bg-amber-100 p-2.5 rounded-full">
+                <AlertTriangle className="h-6 w-6 text-amber-600" />
+              </div>
+              <h3 className="text-lg font-bold text-slate-900">Cảnh báo dữ liệu bị trùng</h3>
+            </div>
+            
+            <div className="space-y-3 text-slate-600 text-sm leading-relaxed mb-6">
+              <p>
+                Phát hiện thông tin tài liệu biên mục này bị trùng lặp với bản ghi đã tồn tại trong cơ sở dữ liệu:
+              </p>
+              
+              <div className="bg-amber-50/50 border border-amber-100 rounded-xl p-3.5 space-y-2 text-xs">
+                <div>
+                  <span className="text-slate-400 block mb-0.5 font-medium">Tên sách trùng:</span>
+                  <strong className="text-slate-800 text-sm block font-bold">{duplicateWarningInfo.title}</strong>
+                </div>
+                <div className="grid grid-cols-2 gap-2 pt-1 border-t border-amber-100/50">
+                  {duplicateWarningInfo.barcode && (
+                    <div>
+                      <span className="text-slate-400 block font-medium">Số ĐKCB:</span>
+                      <strong className="text-slate-700 font-bold">{duplicateWarningInfo.barcode}</strong>
+                    </div>
+                  )}
+                  {duplicateWarningInfo.isbn && (
+                    <div>
+                      <span className="text-slate-400 block font-medium">Mã ISBN:</span>
+                      <strong className="text-slate-700 font-bold">{duplicateWarningInfo.isbn}</strong>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <p className="text-xs text-rose-600 font-bold bg-rose-50 px-3 py-2 rounded-lg leading-normal">
+                ⚠️ Bạn có muốn tiếp tục lưu đè/lưu thêm bản ghi trùng lặp này hay không?
+              </p>
+            </div>
+
+            <div className="flex gap-3 justify-end">
+              <button
+                type="button"
+                onClick={() => {
+                  setShowDuplicateModal(false);
+                  setPendingRecord(null);
+                  setDuplicateWarningInfo(null);
+                  triggerMessage("info", "Đã hủy lưu bản ghi trùng. Bạn có thể chỉnh sửa lại thông tin form.");
+                }}
+                className="flex-1 bg-slate-100 hover:bg-slate-200 text-slate-700 px-4 py-2.5 rounded-xl text-xs font-bold transition-all border border-slate-200 cursor-pointer text-center"
+              >
+                Quay lại chỉnh sửa (Giữ form)
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  if (pendingRecord) {
+                    const isEdit = duplicateWarningInfo.isEdit;
+                    setShowDuplicateModal(false);
+                    setPendingRecord(null);
+                    setDuplicateWarningInfo(null);
+                    await executeSaveRecord(pendingRecord, isEdit);
+                  }
+                }}
+                className="flex-1 bg-amber-600 hover:bg-amber-700 text-white px-4 py-2.5 rounded-xl text-xs font-bold transition-all shadow-md hover:shadow-lg cursor-pointer text-center"
+              >
+                Vẫn tiếp tục lưu
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

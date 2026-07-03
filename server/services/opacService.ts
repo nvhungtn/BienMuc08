@@ -4,6 +4,7 @@ import puppeteer, { Browser, ElementHandle } from "puppeteer";
 import logger from "../utils/logger";
 import { isValidIsbn, cleanIsbn } from "../utils/isbnValidator";
 import isbn3 from "isbn3";
+import fs from "fs";
 
 export interface MarcField {
   tag: string;
@@ -114,22 +115,68 @@ async function fetchWithRetry(url: string, retries = 3, timeout = 10000): Promis
  * Core service to search and scrape data from OPAC NLV
  */
 export async function searchOpacByIsbn(isbn: string): Promise<{ book: BookData; marc21: Marc21Data } | null> {
+  const rawOriginal = isbn.trim();
   const cleaned = cleanIsbn(isbn);
   if (!isValidIsbn(cleaned)) {
     throw new Error("Mã ISBN không hợp lệ hoặc sai định dạng.");
   }
 
-  // Generate potential search formats (hyphenated standard vs unhyphenated)
-  const hyphenated = isbn3.hyphenate(cleaned);
+  // Generate all potential search formats to exhaustively search NLV OPAC
   const searchTerms: string[] = [];
-  if (hyphenated) {
-    searchTerms.push(hyphenated);
+
+  // 1. Raw original input string as entered by user
+  if (rawOriginal && !searchTerms.includes(rawOriginal)) {
+    searchTerms.push(rawOriginal);
   }
+
+  // 2. Standard ISBN-13 formats
+  let isbn13Clean = "";
+  if (cleaned.length === 13) {
+    isbn13Clean = cleaned;
+  } else if (cleaned.length === 10) {
+    const parsed = isbn3.parse(cleaned);
+    if (parsed && parsed.isbn13) {
+      isbn13Clean = parsed.isbn13;
+    }
+  }
+
+  if (isbn13Clean) {
+    if (!searchTerms.includes(isbn13Clean)) {
+      searchTerms.push(isbn13Clean);
+    }
+    const hyphenated13 = isbn3.hyphenate(isbn13Clean);
+    if (hyphenated13 && !searchTerms.includes(hyphenated13)) {
+      searchTerms.push(hyphenated13);
+    }
+  }
+
+  // 3. Standard ISBN-10 formats
+  let isbn10Clean = "";
+  if (cleaned.length === 10) {
+    isbn10Clean = cleaned;
+  } else if (cleaned.length === 13) {
+    const parsed = isbn3.parse(cleaned);
+    if (parsed && parsed.isbn10) {
+      isbn10Clean = parsed.isbn10;
+    }
+  }
+
+  if (isbn10Clean) {
+    if (!searchTerms.includes(isbn10Clean)) {
+      searchTerms.push(isbn10Clean);
+    }
+    const hyphenated10 = isbn3.hyphenate(isbn10Clean);
+    if (hyphenated10 && !searchTerms.includes(hyphenated10)) {
+      searchTerms.push(hyphenated10);
+    }
+  }
+
+  // Fallback to cleaned if not included
   if (!searchTerms.includes(cleaned)) {
     searchTerms.push(cleaned);
   }
 
-  logger.info(`Bắt đầu quy trình tra cứu ISBN bằng Puppeteer cho: ${cleaned}. Các dạng thử nghiệm: ${searchTerms.join(", ")}`);
+  logger.info(`Bắt đầu quy trình tra cứu ISBN bằng Puppeteer cho: ${cleaned}. Các định dạng thử nghiệm tại TVQG VN: ${searchTerms.join(", ")}`);
   
   if (process.env.DISABLE_PUPPETEER === "true") {
     logger.info(`Puppeteer đã bị tắt theo cấu hình (DISABLE_PUPPETEER=true) cho ISBN: ${cleaned}`);
@@ -156,9 +203,29 @@ export async function searchOpacByIsbn(isbn: string): Promise<{ book: BookData; 
         ]
       };
 
-      if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+      if (process.env.PUPPETEER_EXECUTABLE_PATH && fs.existsSync(process.env.PUPPETEER_EXECUTABLE_PATH)) {
         logger.info(`Sử dụng đường dẫn trình duyệt cấu hình sẵn: ${process.env.PUPPETEER_EXECUTABLE_PATH}`);
         launchOptions.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+      } else {
+        const alternativePaths = [
+          "/usr/bin/google-chrome",
+          "/usr/bin/google-chrome-stable",
+          "/usr/bin/chromium",
+          "/usr/bin/chromium-browser",
+          "/usr/bin/chrome"
+        ];
+        let foundAlt = false;
+        for (const altPath of alternativePaths) {
+          if (fs.existsSync(altPath)) {
+            logger.info(`Đường dẫn cấu hình sẵn không tồn tại hoặc không hợp lệ. Đã tìm thấy trình duyệt thay thế tại: ${altPath}`);
+            launchOptions.executablePath = altPath;
+            foundAlt = true;
+            break;
+          }
+        }
+        if (!foundAlt && process.env.PUPPETEER_EXECUTABLE_PATH) {
+          logger.warn(`CẢNH BÁO: Đường dẫn cấu hình sẵn ${process.env.PUPPETEER_EXECUTABLE_PATH} không tồn tại và không tìm thấy trình duyệt thay thế nào.`);
+        }
       }
 
       logger.info("Khởi tạo trình duyệt Puppeteer nội bộ...");
@@ -240,10 +307,23 @@ export async function searchOpacByIsbn(isbn: string): Promise<{ book: BookData; 
       logger.info("Đang chờ kết quả phản hồi từ máy chủ...");
       await delay(4000);
 
-      // Kiểm tra xem có thông báo không tìm thấy kết quả nào không
+      // Kiểm tra xem có thông báo không tìm thấy kết quả nào không, hoặc không tìm thấy bất kỳ link chi tiết nào
       const isNotFound = await page.evaluate(() => {
         const txt = document.body.innerText.toLowerCase();
-        return txt.includes("không tìm thấy") || txt.includes("no results") || txt.includes("tìm thấy 0");
+        const hasNoResultText = txt.includes("không tìm thấy") || 
+                                txt.includes("no results") || 
+                                txt.includes("tìm thấy 0") || 
+                                txt.includes("0 tài liệu") || 
+                                txt.includes("0 kết quả");
+        if (hasNoResultText) return true;
+
+        // Tìm xem có bất kỳ liên kết chi tiết nào không
+        const links = Array.from(document.querySelectorAll("a"));
+        const hasDetailLink = links.some(el => {
+          const href = el.getAttribute("href") || "";
+          return href.includes("/chi-tiet-tai-lieu/") || href.includes("/Record/");
+        });
+        return !hasDetailLink;
       });
 
       if (!isNotFound) {
@@ -262,6 +342,31 @@ export async function searchOpacByIsbn(isbn: string): Promise<{ book: BookData; 
     logger.info("Bước 3: Trích xuất liên kết chi tiết tài liệu đầu tiên...");
     // Tìm liên kết chi tiết tài liệu (/chi-tiet-tai-lieu/ hoặc /Record/)
     const detailLink = await page.evaluate(() => {
+      // Ưu tiên tìm trong vùng chứa danh sách kết quả thực tế trước để tránh các liên kết sidebar/carousel/header/popular
+      const resultContainers = [
+        ".result", 
+        ".result-item", 
+        ".media-body", 
+        "#view-list", 
+        ".search-results", 
+        "#content", 
+        ".main", 
+        "main"
+      ];
+      
+      for (const selector of resultContainers) {
+        const container = document.querySelector(selector);
+        if (container) {
+          const links = Array.from(container.querySelectorAll("a"));
+          const targetLink = links.find(el => {
+            const href = el.getAttribute("href") || "";
+            return href.includes("/chi-tiet-tai-lieu/") || href.includes("/Record/");
+          });
+          if (targetLink) return targetLink.href;
+        }
+      }
+
+      // Dự phòng tìm toàn trang nếu không có container cụ thể
       const links = Array.from(document.querySelectorAll("a"));
       const targetLink = links.find(el => {
         const href = el.getAttribute("href") || "";
@@ -309,6 +414,17 @@ export async function searchOpacByIsbn(isbn: string): Promise<{ book: BookData; 
     }
 
     const book = mapMarcToBook(marc21, cleaned);
+
+    // KIỂM TRA CHÉO CHẶT CHẼ: Kiểm tra chéo mã ISBN thực tế của sách vừa tìm được với mã ISBN được yêu cầu
+    // Để đảm bảo 100% không bị nhận sai sách nổi bật/sách mượn nhiều do lỗi giao dịch, lỗi cập nhật UI, hoặc query trống của OPAC
+    const parsedIsbnRaw = marc21.fields.find(f => f.tag === "020")?.subfields["a"] || "";
+    if (parsedIsbnRaw) {
+      if (!isSameIsbn(parsedIsbnRaw, cleaned)) {
+        logger.error(`CẢNH BÁO: Phát hiện sai lệch ISBN nghiêm trọng từ OPAC! Yêu cầu: ${cleaned}, Thực tế: ${parsedIsbnRaw} (${book.title})`);
+        throw new Error(`ISBN_MISMATCH: Kết quả tìm kiếm từ OPAC có mã ISBN (${parsedIsbnRaw}) không khớp với mã yêu cầu (${cleaned}).`);
+      }
+    }
+
     logger.info(`Tra cứu và biên mục thành công sách: ${book.title}`);
     return { book, marc21 };
 
@@ -600,4 +716,29 @@ export function exportToMarcXml(data: Marc21Data): string {
 
   xml += `</record>`;
   return xml;
+}
+
+/**
+ * Helper to check if two ISBN strings represent the same book (handles formatting, ISBN-10, ISBN-13, and extra suffixes)
+ */
+export function isSameIsbn(isbnA: string, isbnB: string): boolean {
+  const cleanA = isbnA.replace(/[^\dX]/gi, "").toUpperCase();
+  const cleanB = isbnB.replace(/[^\dX]/gi, "").toUpperCase();
+  
+  if (cleanA === cleanB) return true;
+  
+  // Try parsing using isbn3 library
+  const parsedA = isbn3.parse(cleanA);
+  const parsedB = isbn3.parse(cleanB);
+  
+  if (parsedA && parsedB) {
+    return parsedA.isbn13 === parsedB.isbn13;
+  }
+  
+  // Substring match as fallback (e.g. if one contains extra cataloging suffixes like "(bìa mềm)")
+  if (cleanA.includes(cleanB) || cleanB.includes(cleanA)) {
+    return true;
+  }
+  
+  return false;
 }
