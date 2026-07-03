@@ -12,7 +12,7 @@ import searchRouter from "./server/routes/search";
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+const PORT = parseInt(process.env.PORT || "3000", 10);
 
 // Keep a cached token and its expiry to avoid requesting it on every API call
 let cachedBackendToken: string | null = null;
