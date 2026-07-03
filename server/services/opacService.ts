@@ -203,7 +203,13 @@ export async function searchOpacByIsbn(isbn: string): Promise<{ book: BookData; 
         ]
       };
 
-      if (process.env.PUPPETEER_EXECUTABLE_PATH && fs.existsSync(process.env.PUPPETEER_EXECUTABLE_PATH)) {
+      const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
+      if (envPath && !fs.existsSync(envPath)) {
+        logger.warn(`Đường dẫn trình duyệt cấu hình sẵn không tồn tại: ${envPath}. Đang loại bỏ khỏi môi trường.`);
+        delete process.env.PUPPETEER_EXECUTABLE_PATH;
+      }
+
+      if (process.env.PUPPETEER_EXECUTABLE_PATH) {
         logger.info(`Sử dụng đường dẫn trình duyệt cấu hình sẵn: ${process.env.PUPPETEER_EXECUTABLE_PATH}`);
         launchOptions.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
       } else {
@@ -217,14 +223,14 @@ export async function searchOpacByIsbn(isbn: string): Promise<{ book: BookData; 
         let foundAlt = false;
         for (const altPath of alternativePaths) {
           if (fs.existsSync(altPath)) {
-            logger.info(`Đường dẫn cấu hình sẵn không tồn tại hoặc không hợp lệ. Đã tìm thấy trình duyệt thay thế tại: ${altPath}`);
+            logger.info(`Đã tìm thấy trình duyệt thay thế tại: ${altPath}`);
             launchOptions.executablePath = altPath;
             foundAlt = true;
             break;
           }
         }
-        if (!foundAlt && process.env.PUPPETEER_EXECUTABLE_PATH) {
-          logger.warn(`CẢNH BÁO: Đường dẫn cấu hình sẵn ${process.env.PUPPETEER_EXECUTABLE_PATH} không tồn tại và không tìm thấy trình duyệt thay thế nào.`);
+        if (!foundAlt) {
+          logger.info("Không tìm thấy trình duyệt hệ thống nào. Để Puppeteer tự động tìm kiếm đường dẫn mặc định...");
         }
       }
 
